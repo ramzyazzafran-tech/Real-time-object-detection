@@ -25,6 +25,62 @@ let lastFpsUpdate = Date.now();
 let currentFps = 0;
 let lastDetections = [];
 
+// Voice announcement state
+const announcedObjects = new Map();
+const VOICE_CONFIDENCE_THRESHOLD = 0.55;
+const OBJECT_DISAPPEAR_RESET_MS = 2500;
+let speechQueue = [];
+let isSpeaking = false;
+
+function enqueueObjectAnnouncement(objectName) {
+    if (!('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
+        console.warn('Text-to-Speech is not supported in this WebView.');
+        return;
+    }
+    speechQueue.push(objectName);
+    speakNextObject();
+}
+
+function speakNextObject() {
+    if (isSpeaking || speechQueue.length === 0 || !('speechSynthesis' in window)) return;
+    const objectName = speechQueue.shift();
+    const utterance = new SpeechSynthesisUtterance(`${objectName} detected`);
+    utterance.lang = 'en-US';
+    utterance.rate = 0.95;
+    utterance.pitch = 1;
+    isSpeaking = true;
+    utterance.onend = () => { isSpeaking = false; speakNextObject(); };
+    utterance.onerror = () => { isSpeaking = false; speakNextObject(); };
+    window.speechSynthesis.speak(utterance);
+}
+
+function announceNewObjects(predictions) {
+    const now = Date.now();
+    const currentlyVisible = new Set();
+
+    predictions.forEach(prediction => {
+        if (prediction.score < VOICE_CONFIDENCE_THRESHOLD) return;
+
+        const objectName = prediction.class;
+        currentlyVisible.add(objectName);
+        const previous = announcedObjects.get(objectName);
+
+        // Announce only on first appearance or after the object has been absent.
+        if (!previous || now - previous.lastSeen > OBJECT_DISAPPEAR_RESET_MS) {
+            enqueueObjectAnnouncement(objectName);
+        }
+        announcedObjects.set(objectName, { lastSeen: now });
+    });
+
+    // Forget objects that have been absent long enough, so they can be announced
+    // again if they return to the camera view.
+    for (const [objectName, state] of announcedObjects.entries()) {
+        if (!currentlyVisible.has(objectName) && now - state.lastSeen > OBJECT_DISAPPEAR_RESET_MS) {
+            announcedObjects.delete(objectName);
+        }
+    }
+}
+
 // Color palette for bounding boxes
 const colors = [
     '#FF5252', '#FF4081', '#E040FB', '#7C4DFF',
@@ -158,6 +214,9 @@ async function detectObjects() {
         const predictions = await model.detect(video);
         const detectionTime = performance.now() - startTime;
         
+        // Announce newly detected objects
+        announceNewObjects(predictions);
+
         // Store last detections
         lastDetections = predictions;
         
@@ -371,6 +430,10 @@ function takeSnapshot() {
 // 9. Stop Everything
 function stopAll() {
     isDetecting = false;
+    speechQueue = [];
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    isSpeaking = false;
+    announcedObjects.clear();
     
     if (stream) {
         stream.getTracks().forEach(track => track.stop());
